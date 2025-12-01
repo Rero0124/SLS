@@ -1,0 +1,406 @@
+//! 프로토콜 메시지 정의
+//!
+//! NACK 기반 프로토콜이므로 메시지는 최소화됨
+
+use serde::{Deserialize, Serialize};
+
+use crate::{ChunkId, SegmentId, MAGIC_NUMBER, PROTOCOL_VERSION};
+
+/// 메시지 타입
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum MessageType {
+    /// 데이터 청크
+    Chunk = 1,
+
+    /// NACK (누락 청크 요청)
+    Nack = 2,
+
+    /// 세그먼트 완료 알림
+    SegmentComplete = 3,
+
+    /// 연결 초기화
+    Init = 4,
+
+    /// 연결 초기화 응답
+    InitAck = 5,
+
+    /// 연결 종료
+    Close = 6,
+
+    /// Heartbeat (생존 확인)
+    Heartbeat = 7,
+
+    /// Heartbeat 응답
+    HeartbeatAck = 8,
+
+    /// 통계 보고 (선택적)
+    Stats = 9,
+
+    /// 흐름 제어 피드백 (클라이언트 → 서버)
+    FlowControl = 10,
+}
+
+/// 메시지 헤더
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageHeader {
+    /// 매직 넘버
+    pub magic: u32,
+
+    /// 프로토콜 버전
+    pub version: u8,
+
+    /// 메시지 타입
+    pub msg_type: MessageType,
+
+    /// 메시지 길이 (헤더 제외)
+    pub payload_len: u32,
+}
+
+impl MessageHeader {
+    pub fn new(msg_type: MessageType, payload_len: u32) -> Self {
+        Self {
+            magic: MAGIC_NUMBER,
+            version: PROTOCOL_VERSION,
+            msg_type,
+            payload_len,
+        }
+    }
+}
+
+/// NACK 메시지 (누락 청크 요청)
+///
+/// 클라이언트에서 서버로 보내는 유일한 주요 메시지
+/// 크기를 최소화하여 업링크 부담 줄임
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NackMessage {
+    /// 세그먼트 ID
+    pub segment_id: SegmentId,
+
+    /// 누락된 청크 ID 목록
+    /// 비트맵이나 범위로 압축 가능하지만 단순 리스트로 시작
+    pub missing_chunk_ids: Vec<ChunkId>,
+
+    /// 현재 수신률 (통계용)
+    pub receive_ratio: f32,
+
+    /// NIC ID (어느 경로로 재전송 요청인지)
+    pub nic_id: u8,
+}
+
+impl NackMessage {
+    pub fn new(
+        segment_id: SegmentId,
+        missing_chunk_ids: Vec<ChunkId>,
+        receive_ratio: f32,
+        nic_id: u8,
+    ) -> Self {
+        Self {
+            segment_id,
+            missing_chunk_ids,
+            receive_ratio,
+            nic_id,
+        }
+    }
+
+    /// 바이트로 직렬화 (최소 크기)
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let payload = bincode::serialize(self).unwrap_or_default();
+        let header = MessageHeader::new(MessageType::Nack, payload.len() as u32);
+        let header_bytes = bincode::serialize(&header).unwrap_or_default();
+
+        let mut buf = Vec::with_capacity(header_bytes.len() + payload.len());
+        buf.extend_from_slice(&header_bytes);
+        buf.extend_from_slice(&payload);
+        buf
+    }
+
+    /// 바이트에서 역직렬화
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        // bincode는 가변 길이이므로 직접 역직렬화 시도
+        // 헤더: magic(4) + version(1) + msg_type(1) + payload_len(4) = 약 14~20바이트
+        if bytes.len() < 14 {
+            return None;
+        }
+
+        // 헤더 파싱 시도 (bincode는 앞에서부터 읽음)
+        let header: MessageHeader = match bincode::deserialize(bytes) {
+            Ok(h) => h,
+            Err(_) => return None,
+        };
+
+        if header.msg_type != MessageType::Nack {
+            return None;
+        }
+
+        // 헤더 직렬화해서 실제 크기 확인
+        let header_bytes = bincode::serialize(&header).ok()?;
+        let header_size = header_bytes.len();
+
+        if bytes.len() < header_size {
+            return None;
+        }
+
+        // 페이로드 파싱
+        bincode::deserialize(&bytes[header_size..]).ok()
+    }
+}
+
+/// 세그먼트 완료 메시지
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SegmentCompleteMessage {
+    pub segment_id: SegmentId,
+    pub total_chunks_received: u32,
+    pub duplicates_received: u32,
+    pub elapsed_ms: u64,
+}
+
+impl SegmentCompleteMessage {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let payload = bincode::serialize(self).unwrap_or_default();
+        let header = MessageHeader::new(MessageType::SegmentComplete, payload.len() as u32);
+        let header_bytes = bincode::serialize(&header).unwrap_or_default();
+
+        let mut buf = Vec::with_capacity(header_bytes.len() + payload.len());
+        buf.extend_from_slice(&header_bytes);
+        buf.extend_from_slice(&payload);
+        buf
+    }
+}
+
+/// 연결 초기화 메시지
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InitMessage {
+    /// 클라이언트가 지원하는 NIC 수
+    pub nic_count: u8,
+
+    /// 요청 청크 크기
+    pub chunk_size: u16,
+
+    /// 요청 세그먼트 크기
+    pub segment_size: u32,
+
+    /// 버퍼 크기 힌트
+    pub buffer_size: u32,
+}
+
+impl InitMessage {
+    pub fn new(nic_count: u8) -> Self {
+        Self {
+            nic_count,
+            chunk_size: 1200,
+            segment_size: 65536,
+            buffer_size: 2 * 1024 * 1024,
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let payload = bincode::serialize(self).unwrap_or_default();
+        let header = MessageHeader::new(MessageType::Init, payload.len() as u32);
+        let header_bytes = bincode::serialize(&header).unwrap_or_default();
+
+        let mut buf = Vec::with_capacity(header_bytes.len() + payload.len());
+        buf.extend_from_slice(&header_bytes);
+        buf.extend_from_slice(&payload);
+        buf
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let header_size = 16; // 대략적 헤더 크기
+        if bytes.len() < header_size {
+            return None;
+        }
+        bincode::deserialize(&bytes[header_size..]).ok()
+    }
+}
+
+/// 연결 초기화 응답
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InitAckMessage {
+    /// 서버가 결정한 NIC 수
+    pub nic_count: u8,
+
+    /// 확정된 청크 크기
+    pub chunk_size: u16,
+
+    /// 확정된 세그먼트 크기
+    pub segment_size: u32,
+
+    /// 서버 기본 중복률
+    pub redundancy_ratio: f32,
+}
+
+impl InitAckMessage {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let payload = bincode::serialize(self).unwrap_or_default();
+        let header = MessageHeader::new(MessageType::InitAck, payload.len() as u32);
+        let header_bytes = bincode::serialize(&header).unwrap_or_default();
+
+        let mut buf = Vec::with_capacity(header_bytes.len() + payload.len());
+        buf.extend_from_slice(&header_bytes);
+        buf.extend_from_slice(&payload);
+        buf
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        // 헤더 파싱해서 실제 크기 확인
+        if bytes.len() < 10 {
+            return None;
+        }
+        
+        let header: MessageHeader = bincode::deserialize(bytes).ok()?;
+        if header.msg_type != MessageType::InitAck {
+            return None;
+        }
+        
+        // 헤더 크기 계산
+        let header_bytes = bincode::serialize(&header).ok()?;
+        let header_size = header_bytes.len();
+        
+        if bytes.len() < header_size {
+            return None;
+        }
+        
+        bincode::deserialize(&bytes[header_size..]).ok()
+    }
+}
+
+/// Heartbeat 메시지
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeartbeatMessage {
+    pub sequence: u64,
+    pub timestamp_us: u64,
+}
+
+impl HeartbeatMessage {
+    pub fn new(sequence: u64) -> Self {
+        let timestamp_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
+
+        Self {
+            sequence,
+            timestamp_us,
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let payload = bincode::serialize(self).unwrap_or_default();
+        let header = MessageHeader::new(MessageType::Heartbeat, payload.len() as u32);
+        let header_bytes = bincode::serialize(&header).unwrap_or_default();
+
+        let mut buf = Vec::with_capacity(header_bytes.len() + payload.len());
+        buf.extend_from_slice(&header_bytes);
+        buf.extend_from_slice(&payload);
+        buf
+    }
+}
+
+/// 흐름 제어 메시지 (클라이언트 → 서버)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlowControlMessage {
+    /// 수신 버퍼 여유 공간 (세그먼트 단위)
+    pub buffer_available: u32,
+    /// 마지막 완료된 세그먼트 ID
+    pub last_completed_segment: u64,
+    /// 현재 처리 중인 세그먼트 수
+    pub segments_in_progress: u32,
+    /// 최근 패킷 손실률 (0.0 ~ 1.0)
+    pub loss_rate: f32,
+    /// 현재 처리 속도 (세그먼트/초)
+    pub processing_rate: f32,
+    /// 권장 전송 속도 (세그먼트/초, 0이면 서버 판단)
+    pub suggested_rate: f32,
+}
+
+impl FlowControlMessage {
+    pub fn new(
+        buffer_available: u32,
+        last_completed_segment: u64,
+        segments_in_progress: u32,
+        loss_rate: f32,
+        processing_rate: f32,
+    ) -> Self {
+        // 손실률과 처리 속도 기반으로 권장 속도 계산
+        let suggested_rate = if loss_rate > 0.1 {
+            // 손실률 10% 이상이면 속도 절반
+            processing_rate * 0.5
+        } else if loss_rate > 0.05 {
+            // 손실률 5% 이상이면 속도 유지
+            processing_rate
+        } else if buffer_available > 100 {
+            // 버퍼 여유 있고 손실률 낮으면 속도 증가
+            processing_rate * 1.2
+        } else {
+            processing_rate
+        };
+
+        Self {
+            buffer_available,
+            last_completed_segment,
+            segments_in_progress,
+            loss_rate,
+            processing_rate,
+            suggested_rate,
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let payload = bincode::serialize(self).unwrap_or_default();
+        let header = MessageHeader::new(MessageType::FlowControl, payload.len() as u32);
+        let header_bytes = bincode::serialize(&header).unwrap_or_default();
+
+        let mut buf = Vec::with_capacity(header_bytes.len() + payload.len());
+        buf.extend_from_slice(&header_bytes);
+        buf.extend_from_slice(&payload);
+        buf
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 16 {
+            return None;
+        }
+        
+        let header: MessageHeader = bincode::deserialize(bytes).ok()?;
+        if header.msg_type != MessageType::FlowControl {
+            return None;
+        }
+        
+        let header_bytes = bincode::serialize(&header).ok()?;
+        let header_size = header_bytes.len();
+        
+        if bytes.len() < header_size {
+            return None;
+        }
+        
+        bincode::deserialize(&bytes[header_size..]).ok()
+    }
+}
+
+/// 통합 메시지 enum
+#[derive(Debug, Clone)]
+pub enum Message {
+    Nack(NackMessage),
+    SegmentComplete(SegmentCompleteMessage),
+    Init(InitMessage),
+    InitAck(InitAckMessage),
+    Heartbeat(HeartbeatMessage),
+    FlowControl(FlowControlMessage),
+    Close,
+}
+
+impl Message {
+    /// 메시지 타입 반환
+    pub fn msg_type(&self) -> MessageType {
+        match self {
+            Message::Nack(_) => MessageType::Nack,
+            Message::SegmentComplete(_) => MessageType::SegmentComplete,
+            Message::Init(_) => MessageType::Init,
+            Message::InitAck(_) => MessageType::InitAck,
+            Message::Heartbeat(_) => MessageType::Heartbeat,
+            Message::FlowControl(_) => MessageType::FlowControl,
+            Message::Close => MessageType::Close,
+        }
+    }
+}
