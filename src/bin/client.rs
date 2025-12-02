@@ -1,18 +1,18 @@
-//! SLS 클라이언트 (수신자) - Super Light Stream Protocol
+//! SFP 클라이언트 (수신자) - Segment Flow Protocol
 //!
 //! NACK 기반 블록 조립형 전송 프로토콜 클라이언트
 //! - 누락 청크만 NACK으로 요청하여 클라이언트 부하 최소화
 //! - X25519 + ChaCha20-Poly1305 암호화 지원 (선택)
 //!
 //! 사용법:
-//!   cargo run --release --bin sls_client -- [OPTIONS]
+//!   cargo run --release --bin sfp-client -- [OPTIONS]
 //!
 //! 예시:
 //!   # 기본 수신
-//!   cargo run --release --bin sls_client -- --server 127.0.0.1:9000 --output received.bin
+//!   cargo run --release --bin sfp-client -- --server 127.0.0.1:9000 --output received.bin
 //!   
 //!   # 예상 크기 지정
-//!   cargo run --release --bin sls_client -- -s 127.0.0.1:9000 -o data.bin --size 104857600
+//!   cargo run --release --bin sfp-client -- -s 127.0.0.1:9000 -o data.bin --size 104857600
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -25,9 +25,9 @@ use tokio::sync::mpsc;
 use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use sls::chunk::Chunk;
-use sls::message::{InitAckMessage, InitMessage, MessageHeader, MessageType, NackMessage};
-use sls::Config;
+use sfp::chunk::Chunk;
+use sfp::message::{InitAckMessage, InitMessage, MessageHeader, MessageType, NackMessage};
+use sfp::Config;
 
 /// 클라이언트 설정
 struct ClientConfig {
@@ -98,14 +98,14 @@ fn parse_args() -> ClientConfig {
             }
             "--help" | "-h" => {
                 println!(
-                    r#"SLS Client - Super Light Stream Protocol 클라이언트
+                    r#"SFP Client - Super Light Stream Protocol 클라이언트
 
 NACK 기반 블록 조립형 고속 전송 프로토콜 클라이언트
 - 누락 청크만 NACK으로 요청하여 클라이언트 부하 최소화
 - X25519 키 교환 + ChaCha20-Poly1305 암호화 지원
 
 사용법:
-  cargo run --release --bin sls_client -- [OPTIONS]
+  cargo run --release --bin sfp-client -- [OPTIONS]
 
 옵션:
   -b, --bind <ADDR>      로컬 바인드 주소 (기본: 0.0.0.0:0 = 자동 할당)
@@ -118,13 +118,13 @@ NACK 기반 블록 조립형 고속 전송 프로토콜 클라이언트
 
 예시:
   # 서버에서 파일 수신
-  cargo run --release --bin sls_client -- --server 192.168.1.100:9000 --output received.bin
+  cargo run --release --bin sfp-client -- --server 192.168.1.100:9000 --output received.bin
   
   # 암호화 수신
-  cargo run --release --bin sls_client -- -s 127.0.0.1:9000 -o data.bin --encrypt
+  cargo run --release --bin sfp-client -- -s 127.0.0.1:9000 -o data.bin --encrypt
   
   # 예상 크기 지정 (100MB) + 암호화
-  cargo run --release --bin sls_client -- -s 127.0.0.1:9000 --size 104857600 -e
+  cargo run --release --bin sfp-client -- -s 127.0.0.1:9000 --size 104857600 -e
 "#
                 );
                 std::process::exit(0);
@@ -147,7 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let client_config = parse_args();
 
-    info!("SLS Client starting...");
+    info!("SFP Client starting...");
     info!("Server address: {}", client_config.server_addr);
     info!("Bind address: {}", client_config.bind_addr);
 

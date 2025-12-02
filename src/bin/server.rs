@@ -1,18 +1,18 @@
-//! SLS 서버 (송신자) - Super Light Stream Protocol
+//! SFP 서버 (송신자) - Segment Flow Protocol
 //!
 //! NACK 기반 블록 조립형 전송 프로토콜 서버
 //! - 공격적 전송 + NACK 재전송으로 고속 전송
 //! - X25519 + ChaCha20-Poly1305 암호화 지원 (선택)
 //!
 //! 사용법:
-//!   cargo run --release --bin sls_server -- [OPTIONS]
+//!   cargo run --release --bin sfp-server -- [OPTIONS]
 //!
 //! 예시:
 //!   # 기본 전송
-//!   cargo run --release --bin sls_server -- --bind 0.0.0.0:9000 --file data.bin
+//!   cargo run --release --bin sfp-server -- --bind 0.0.0.0:9000 --file data.bin
 //!   
 //!   # 암호화 전송 + 50% 중복
-//!   cargo run --release --bin sls_server -- -f data.bin --encrypt --redundancy 0.5
+//!   cargo run --release --bin sfp-server -- -f data.bin --encrypt --redundancy 0.5
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -23,10 +23,10 @@ use tokio::sync::mpsc;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use sls::bbr::BbrLite;
-use sls::chunk::SegmentBuilder;
-use sls::message::{InitAckMessage, InitMessage, MessageHeader, MessageType, NackMessage};
-use sls::Config;
+use sfp::bbr::BbrLite;
+use sfp::chunk::SegmentBuilder;
+use sfp::message::{InitAckMessage, InitMessage, MessageHeader, MessageType, NackMessage};
+use sfp::Config;
 
 /// 서버 설정
 struct ServerConfig {
@@ -100,14 +100,14 @@ fn parse_args() -> ServerConfig {
             }
             "--help" | "-h" => {
                 println!(
-                    r#"SLS Server - Super Light Stream Protocol 서버
+                    r#"SFP Server - Segment Flow Protocol 서버
 
 NACK 기반 블록 조립형 고속 전송 프로토콜 서버
 - 공격적 전송 + NACK 기반 재전송
 - X25519 키 교환 + ChaCha20-Poly1305 암호화 지원
 
 사용법:
-  cargo run --release --bin sls_server -- [OPTIONS]
+  cargo run --release --bin sfp-server -- [OPTIONS]
 
 옵션:
   -b, --bind <ADDR>       바인드 주소 (기본: 0.0.0.0:9000)
@@ -121,13 +121,13 @@ NACK 기반 블록 조립형 고속 전송 프로토콜 서버
 
 예시:
   # 파일 전송
-  cargo run --release --bin sls_server -- --file large_file.bin
+  cargo run --release --bin sfp-server -- --file large_file.bin
   
   # 암호화 전송
-  cargo run --release --bin sls_server -- -f data.bin --encrypt
+  cargo run --release --bin sfp-server -- -f data.bin --encrypt
   
   # 30% 중복 + 암호화 (불안정 네트워크용)
-  cargo run --release --bin sls_server -- -f data.bin --redundancy 0.3 -e
+  cargo run --release --bin sfp-server -- -f data.bin --redundancy 0.3 -e
 "#
                 );
                 std::process::exit(0);
@@ -150,7 +150,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let server_config = parse_args();
 
-    info!("SLS Server starting...");
+    info!("SFP Server starting...");
     info!("Bind address: {}", server_config.bind_addr);
     info!("Chunk size: {} bytes", server_config.config.chunk_size);
     info!("Segment size: {} bytes", server_config.config.segment_size);
@@ -180,7 +180,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = server_config.config.clone();
 
     // 세그먼트 청크 캐시 (NACK 재전송용 - 이미 분할된 청크 저장)
-    let segment_chunks: Arc<tokio::sync::RwLock<std::collections::HashMap<u64, Vec<sls::chunk::Chunk>>>> =
+    let segment_chunks: Arc<tokio::sync::RwLock<std::collections::HashMap<u64, Vec<sfp::chunk::Chunk>>>> =
         Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     
     // BBR 혼잡 제어 (향후 동적 pacing용)

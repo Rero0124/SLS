@@ -1,20 +1,20 @@
 [package]
-name = "sls"
+name = "sfp"
 version = "0.1.0"
 edition = "2021"
-description = "SLS (Super Light Stream) - NACK-based block assembly protocol over UDP"
-authors = ["SLS Protocol Team"]
+description = "SFP (Segment Flow Protocol) - NACK-based block assembly protocol over UDP"
+authors = ["SFP Protocol Team"]
 
 [lib]
-name = "sls"
+name = "sfp"
 path = "src/lib.rs"
 
 [[bin]]
-name = "sls-server"
+name = "sfp-server"
 path = "src/bin/server.rs"
 
 [[bin]]
-name = "sls-client"
+name = "sfp-client"
 path = "src/bin/client.rs"
 
 [dependencies]

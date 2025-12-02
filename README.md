@@ -1,4 +1,4 @@
-# SLS (Super Light Stream) Protocol
+# SFP (Segment Flow Protocol)
 
 UDP 기반 **NACK 블록 조립형** 전송 프로토콜 - Rust 구현
 
@@ -21,7 +21,7 @@ UDP 기반 **NACK 블록 조립형** 전송 프로토콜 - Rust 구현
 ## 📦 구조
 
 ```
-SLS/
+SFP/
 ├── src/
 │   ├── lib.rs           # 라이브러리 진입점
 │   ├── bbr.rs           # BBR-lite 혼잡제어
@@ -49,10 +49,10 @@ SLS/
 cargo build --release
 
 # 서버 실행 (송신자)
-cargo run --release --bin sls-server -- --bind 0.0.0.0:9000 --file data.bin
+cargo run --release --bin sfp-server -- --bind 0.0.0.0:9000 --file data.bin
 
 # 클라이언트 실행 (수신자)
-cargo run --release --bin sls-client -- --server 127.0.0.1:9000 --output received.bin
+cargo run --release --bin sfp-client -- --server 127.0.0.1:9000 --output received.bin
 
 # 대용량 파일 전송 테스트 (2GB, 암호화)
 cargo run --release --example large_file_test -- --server --size 2000 --encrypt
@@ -96,7 +96,7 @@ cargo run --release --example large_file_test -- --client --encrypt
 ## 🔧 설정 옵션
 
 ```rust
-use sls::Config;
+use sfp::Config;
 
 // 기본 설정
 let config = Config::default();
@@ -129,7 +129,7 @@ real_throughput = raw_bandwidth × (1 - loss_rate) × (1 - redundancy_ratio)
 
 ## 🎯 장점 (vs TCP/QUIC)
 
-| 환경 | SLS | TCP | QUIC |
+| 환경 | SFP | TCP | QUIC |
 |------|-----|-----|------|
 | 저사양 기기 | ✅ 매우 빠름 | ❌ ACK 오버헤드 | ⚠️ 복잡성 |
 | 고손실 환경 | ✅ 중복으로 보정 | ❌ 재전송 지연 | ⚠️ RTT 의존 |
@@ -141,7 +141,7 @@ real_throughput = raw_bandwidth × (1 - loss_rate) × (1 - redundancy_ratio)
 ### 서버 (송신자)
 
 ```rust
-use sls::{Config, Sender, PathManager};
+use sfp::{Config, Sender, PathManager};
 use std::sync::Arc;
 
 #[tokio::main]
@@ -158,7 +158,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### 클라이언트 (수신자)
 
 ```rust
-use sls::{Config, receiver::Receiver, PathManager};
+use sfp::{Config, receiver::Receiver, PathManager};
 use std::sync::Arc;
 
 #[tokio::main]

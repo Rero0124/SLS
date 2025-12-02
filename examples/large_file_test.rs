@@ -21,11 +21,11 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use sls::bbr::BbrLite;
-use sls::chunk::SegmentBuilder;
-use sls::crypto::{CryptoSession, EphemeralKeyPair, KeyExchangeMessage};
-use sls::message::{FlowControlMessage, InitAckMessage, InitMessage, MessageHeader, MessageType, NackMessage};
-use sls::Config;
+use sfp::bbr::BbrLite;
+use sfp::chunk::SegmentBuilder;
+use sfp::crypto::{CryptoSession, EphemeralKeyPair, KeyExchangeMessage};
+use sfp::message::{FlowControlMessage, InitAckMessage, InitMessage, MessageHeader, MessageType, NackMessage};
+use sfp::Config;
 
 /// 테스트용 텍스트 데이터 생성
 fn generate_test_text(size_mb: usize) -> Vec<u8> {
@@ -38,7 +38,7 @@ fn generate_test_text(size_mb: usize) -> Vec<u8> {
         "Lorem ipsum dolor sit amet, consectetur adipiscing elit. ",
         "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ",
         "가나다라마바사아자차카타파하 ",
-        "Hello, World! This is SLS Protocol test data. ",
+        "Hello, World! This is SFP Protocol test data. ",
         "🚀 UDP-based NACK block assembly protocol testing... ",
     ];
 
@@ -236,7 +236,7 @@ async fn run_server(
     info!("🚀 전송 시작: {} 세그먼트", total_segments);
 
     // 세그먼트별 청크 저장 (재전송용)
-    let segment_chunks: Arc<RwLock<HashMap<u64, Vec<sls::chunk::Chunk>>>> = 
+    let segment_chunks: Arc<RwLock<HashMap<u64, Vec<sfp::chunk::Chunk>>>> = 
         Arc::new(RwLock::new(HashMap::new()));
 
     // BBR 혼잡 제어
@@ -600,7 +600,7 @@ async fn run_client(
     // ═══════════════════════════════════════════════════════════════
     // Init/InitAck 핸드쉐이크 (수신 큐에서 읽기) - RTT 측정 포함
     // ═══════════════════════════════════════════════════════════════
-    let init_msg = sls::message::InitMessage::new(encrypt, [0u8; 32]);
+    let init_msg = sfp::message::InitMessage::new(encrypt, [0u8; 32]);
     let init_send_time = Instant::now(); // Init 전송 시간 기록 (RTT 측정용)
     let retry_interval = Duration::from_millis(500);
     let max_retries = 20;
@@ -608,7 +608,7 @@ async fn run_client(
     
     info!("📤 Init 전송 (서버 응답 대기 중)...");
     
-    let (init_ack, crypto_session, rtt_us): (sls::message::InitAckMessage, Option<Arc<Mutex<CryptoSession>>>, u64) = loop {
+    let (init_ack, crypto_session, rtt_us): (sfp::message::InitAckMessage, Option<Arc<Mutex<CryptoSession>>>, u64) = loop {
         // Init 전송 (송신 큐 사용)
         let _ = send_tx.send(init_msg.to_bytes()).await;
         
@@ -622,7 +622,7 @@ async fn run_client(
             Ok(Some(data)) => {
                 drop(rx);  // 락 해제
                 
-                if let Some(ack) = sls::message::InitAckMessage::from_bytes(&data) {
+                if let Some(ack) = sfp::message::InitAckMessage::from_bytes(&data) {
                     // RTT 계산
                     let rtt = init_send_time.elapsed().as_micros() as u64;
                     break (ack, None, rtt);
@@ -648,7 +648,7 @@ async fn run_client(
                             match tokio::time::timeout(retry_interval, rx.recv()).await {
                                 Ok(Some(data)) => {
                                     drop(rx);
-                                    if let Some(ack) = sls::message::InitAckMessage::from_bytes(&data) {
+                                    if let Some(ack) = sfp::message::InitAckMessage::from_bytes(&data) {
                                         break ack;
                                     }
                                 }
@@ -777,7 +777,7 @@ async fn run_client(
                 *last_chunk.write().await = Instant::now();
                 
                 // 청크 파싱
-                if let Some(chunk) = sls::chunk::Chunk::from_bytes(&data) {
+                if let Some(chunk) = sfp::chunk::Chunk::from_bytes(&data) {
                     let segment_id = chunk.header.segment_id;
                     let chunk_id = chunk.header.chunk_id;
                     let total_chunks = chunk.header.total_chunks;
@@ -1106,7 +1106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if is_server {
         // 서버 모드
         info!("═══════════════════════════════════════════");
-        info!("  SLS 대용량 전송 테스트 - 서버");
+        info!("  SFP 대용량 전송 테스트 - 서버");
         if encrypt {
             info!("  🔐 암호화: X25519 + ChaCha20-Poly1305");
         }
@@ -1118,7 +1118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else if is_client {
         // 클라이언트 모드
         info!("═══════════════════════════════════════════");
-        info!("  SLS 대용량 전송 테스트 - 클라이언트");
+        info!("  SFP 대용량 전송 테스트 - 클라이언트");
         if encrypt {
             info!("  🔐 암호화: X25519 + ChaCha20-Poly1305");
         }
