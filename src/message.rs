@@ -195,10 +195,19 @@ pub struct InitMessage {
     
     /// 프로토콜 버전
     pub protocol_version: u8,
+    
+    /// 클라이언트 타임스탬프 (microseconds since epoch) - RTT 측정용
+    pub timestamp_us: u64,
 }
 
 impl InitMessage {
     pub fn new(encryption_enabled: bool, client_public_key: [u8; 32]) -> Self {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let timestamp_us = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0);
+        
         Self {
             client_public_key,
             encryption_enabled,
@@ -207,6 +216,7 @@ impl InitMessage {
             segment_size: 0, // 서버 기본값 사용
             buffer_size: 2 * 1024 * 1024,
             protocol_version: crate::PROTOCOL_VERSION,
+            timestamp_us,
         }
     }
 
@@ -283,6 +293,12 @@ pub struct InitAckMessage {
     
     /// 프로토콜 버전
     pub protocol_version: u8,
+    
+    /// 클라이언트 타임스탬프 에코 (클라이언트가 보낸 값 그대로 반환)
+    pub client_timestamp_us: u64,
+    
+    /// 서버 타임스탬프 (서버에서 응답 보낼 때 시간)
+    pub server_timestamp_us: u64,
 }
 
 impl InitAckMessage {
@@ -292,6 +308,23 @@ impl InitAckMessage {
         segment_size: u32,
         redundancy_ratio: f32,
     ) -> Self {
+        Self::with_client_timestamp(total_file_size, chunk_size, segment_size, redundancy_ratio, 0)
+    }
+    
+    /// 클라이언트 타임스탬프를 포함한 생성자 (RTT 측정용)
+    pub fn with_client_timestamp(
+        total_file_size: u64,
+        chunk_size: u16,
+        segment_size: u32,
+        redundancy_ratio: f32,
+        client_timestamp_us: u64,
+    ) -> Self {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let server_timestamp_us = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0);
+        
         let chunks_per_segment = (segment_size as usize / chunk_size as usize) as u32;
         let total_segments = (total_file_size + segment_size as u64 - 1) / segment_size as u64;
         
@@ -307,6 +340,8 @@ impl InitAckMessage {
             total_segments,
             chunks_per_segment,
             protocol_version: crate::PROTOCOL_VERSION,
+            client_timestamp_us,
+            server_timestamp_us,
         }
     }
 
