@@ -218,15 +218,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // ─────────────────────────────────────────────────────────────────
-    // 수신 및 처리 루프
+    // 수신 큐 + 수신 태스크
     // ─────────────────────────────────────────────────────────────────
-    let mut buf = vec![0u8; 65535];
+    let (recv_tx, mut recv_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(100_000);
+    
+    let recv_socket = socket.clone();
+    let _recv_task = tokio::spawn(async move {
+        let mut buf = vec![0u8; 2048];
+        loop {
+            match recv_socket.recv_from(&mut buf).await {
+                Ok((len, addr)) => {
+                    let _ = recv_tx.try_send((buf[..len].to_vec(), addr));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
     let data = Arc::new(data);
 
     info!("Waiting for client connection (Init)...");
 
-    loop {
-        let (len, addr) = socket.recv_from(&mut buf).await?;
+    let mut transfer_started = false;
+    let mut cached_init_ack: Option<Vec<u8>> = None;
+
+    while let Some((buf, addr)) = recv_rx.recv().await {
+        let len = buf.len();
 
         // 메시지 파싱
         if let Ok(header) = bincode::deserialize::<MessageHeader>(&buf[..len.min(32)]) {
@@ -234,87 +251,96 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 MessageType::Init => {
                     // 초기화 요청 처리
                     if let Some(init_req) = InitMessage::from_bytes(&buf[..len]) {
-                        info!("Init received from: {}", addr);
-                        info!("  Client encryption: {}", init_req.encryption_enabled);
-                        info!("  Protocol version: {}", init_req.protocol_version);
-
-                        // InitAck 응답 생성
-                        let mut init_ack = InitAckMessage::new(
-                            data.len() as u64,
-                            config.chunk_size as u16,
-                            config.segment_size as u32,
-                            config.base_redundancy_ratio as f32,
-                        );
-                        init_ack.encryption_enabled = init_req.encryption_enabled;
+                        // InitAck 생성 또는 캐시된 것 사용
+                        let init_ack_bytes = if let Some(ref cached) = cached_init_ack {
+                            cached.clone()
+                        } else {
+                            let mut init_ack = InitAckMessage::new(
+                                data.len() as u64,
+                                config.chunk_size as u16,
+                                config.segment_size as u32,
+                                config.base_redundancy_ratio as f32,
+                            );
+                            init_ack.encryption_enabled = init_req.encryption_enabled;
+                            let bytes = init_ack.to_bytes();
+                            cached_init_ack = Some(bytes.clone());
+                            
+                            info!("Init received from: {}", addr);
+                            info!("  Total file size: {} bytes", init_ack.total_file_size);
+                            info!("  Total segments: {}", init_ack.total_segments);
+                            bytes
+                        };
 
                         // InitAck을 우선순위 큐로 전송
-                        let _ = priority_tx.send((init_ack.to_bytes(), addr)).await;
-                        
-                        info!("InitAck queued (priority):");
-                        info!("  Total file size: {} bytes", init_ack.total_file_size);
-                        info!("  Total segments: {}", init_ack.total_segments);
+                        let _ = priority_tx.send((init_ack_bytes, addr)).await;
 
-                        // 데이터 전송 시작 (별도 태스크로)
-                        let data_clone = data.clone();
-                        let config_clone = config.clone();
-                        let segment_builder_clone = segment_builder.clone();
-                        let segment_cache_clone = segment_cache.clone();
-                        let data_tx_clone = data_tx.clone();
-                        
-                        tokio::spawn(async move {
-                            info!("Starting data transfer...");
-                            let start = std::time::Instant::now();
+                        // 첫 번째 Init에서만 데이터 전송 시작
+                        if !transfer_started {
+                            transfer_started = true;
+                            
+                            let data_clone = data.clone();
+                            let config_clone = config.clone();
+                            let segment_builder_clone = segment_builder.clone();
+                            let segment_cache_clone = segment_cache.clone();
+                            let data_tx_clone = data_tx.clone();
+                            let total_segments = (data.len() + config.segment_size - 1) / config.segment_size;
+                            
+                            tokio::spawn(async move {
+                                info!("Starting data transfer...");
+                                let start = std::time::Instant::now();
 
-                            let mut segment_id = 1u64;
-                            let mut offset = 0;
-                            let mut total_chunks = 0u64;
-                            let total_segments = init_ack.total_segments;
+                                let mut segment_id = 1u64;
+                                let mut offset = 0;
+                                let mut total_chunks = 0u64;
 
-                            while offset < data_clone.len() {
-                                let end = (offset + config_clone.segment_size).min(data_clone.len());
-                                let segment_data = &data_clone[offset..end];
+                                while offset < data_clone.len() {
+                                    let end = (offset + config_clone.segment_size).min(data_clone.len());
+                                    let segment_data = &data_clone[offset..end];
 
-                                // 세그먼트 캐시 저장
-                                {
-                                    let mut cache = segment_cache_clone.write().await;
-                                    cache.insert(segment_id, segment_data.to_vec());
-                                }
-
-                                // 청크 분할 및 전송
-                                let chunks = segment_builder_clone.split_into_chunks(segment_id, segment_data, 0);
-                                let redundant_chunks = segment_builder_clone
-                                    .create_redundant_chunks(&chunks, config_clone.base_redundancy_ratio);
-
-                                for chunk in chunks.iter().chain(redundant_chunks.iter()) {
-                                    let bytes = chunk.to_bytes();
-                                    // 일반 데이터 큐로 전송
-                                    if data_tx_clone.send((bytes, addr)).await.is_err() {
-                                        return;
+                                    // 세그먼트 캐시 저장
+                                    {
+                                        let mut cache = segment_cache_clone.write().await;
+                                        cache.insert(segment_id, segment_data.to_vec());
                                     }
-                                    total_chunks += 1;
+
+                                    // 청크 분할 및 전송
+                                    let chunks = segment_builder_clone.split_into_chunks(segment_id, segment_data, 0);
+                                    let redundant_chunks = segment_builder_clone
+                                        .create_redundant_chunks(&chunks, config_clone.base_redundancy_ratio);
+
+                                    for chunk in chunks.iter().chain(redundant_chunks.iter()) {
+                                        let bytes = chunk.to_bytes();
+                                        if data_tx_clone.send((bytes, addr)).await.is_err() {
+                                            return;
+                                        }
+                                        total_chunks += 1;
+                                    }
+
+                                    if segment_id % 10 == 0 || offset + config_clone.segment_size >= data_clone.len() {
+                                        info!(
+                                            "Progress: segment {}/{} ({:.1}%)",
+                                            segment_id, total_segments,
+                                            (offset as f64 / data_clone.len() as f64) * 100.0
+                                        );
+                                    }
+
+                                    segment_id += 1;
+                                    offset = end;
                                 }
 
-                                if segment_id % 10 == 0 || offset + config_clone.segment_size >= data_clone.len() {
-                                    info!(
-                                        "Progress: segment {}/{} ({:.1}%)",
-                                        segment_id, total_segments,
-                                        (offset as f64 / data_clone.len() as f64) * 100.0
-                                    );
-                                }
+                                let elapsed = start.elapsed();
+                                let throughput = data_clone.len() as f64 / elapsed.as_secs_f64() / 1_000_000.0;
 
-                                segment_id += 1;
-                                offset = end;
-                            }
-
-                            let elapsed = start.elapsed();
-                            let throughput = data_clone.len() as f64 / elapsed.as_secs_f64() / 1_000_000.0;
-
-                            info!("Initial transfer complete!");
-                            info!("  Time: {:.2}s", elapsed.as_secs_f64());
-                            info!("  Total chunks: {}", total_chunks);
-                            info!("  Throughput: {:.2} MB/s", throughput);
-                            info!("Waiting for NACK retransmission requests...");
-                        });
+                                info!("Initial transfer complete!");
+                                info!("  Time: {:.2}s", elapsed.as_secs_f64());
+                                info!("  Total chunks: {}", total_chunks);
+                                info!("  Throughput: {:.2} MB/s", throughput);
+                                info!("Waiting for NACK retransmission requests...");
+                            });
+                        } else {
+                            // 이미 전송 중이면 InitAck만 재전송 (로그는 간략히)
+                            info!("Init re-received, InitAck resent (transfer already in progress)");
+                        }
                     }
                 }
 

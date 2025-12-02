@@ -164,11 +164,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (priority_tx, mut priority_rx) = mpsc::channel::<Vec<u8>>(1000);
     let (_data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(10_000);
 
-    // 송신 태스크: 우선순위 큐 먼저
+    // 송신 태스크
     let send_socket = socket.clone();
     let _send_task = tokio::spawn(async move {
         loop {
-            // 1. 우선순위 큐 확인 (non-blocking)
             match priority_rx.try_recv() {
                 Ok(bytes) => {
                     let _ = send_socket.send_to(&bytes, server_addr).await;
@@ -178,7 +177,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(mpsc::error::TryRecvError::Disconnected) => break,
             }
 
-            // 2. 양쪽 큐 모두 확인
             tokio::select! {
                 Some(bytes) = priority_rx.recv() => {
                     let _ = send_socket.send_to(&bytes, server_addr).await;
@@ -191,46 +189,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // 초기화 메시지 생성
-    let init_request = InitMessage::new(
-        client_config.encrypt,
-        [0u8; 32], // TODO: 실제 공개키 생성
-    );
+    // ═══════════════════════════════════════════════════════════════
+    // 수신 큐 + 수신 태스크
+    // ═══════════════════════════════════════════════════════════════
+    let (recv_tx, recv_rx) = mpsc::channel::<Vec<u8>>(100_000);
+    let recv_rx = Arc::new(tokio::sync::Mutex::new(recv_rx));
+    
+    let recv_socket = socket.clone();
+    let _recv_task = tokio::spawn(async move {
+        let mut buf = vec![0u8; 2048];
+        loop {
+            match recv_socket.recv_from(&mut buf).await {
+                Ok((len, _)) => {
+                    let _ = recv_tx.try_send(buf[..len].to_vec());
+                }
+                Err(_) => break,
+            }
+        }
+    });
 
     // === Phase 1: 핸드쉐이크 (Init/InitAck) ===
+    let init_request = InitMessage::new(
+        client_config.encrypt,
+        [0u8; 32],
+    );
+
     info!("Sending Init to server (via priority queue)...");
     let mut init_ack: Option<InitAckMessage> = None;
     let mut retry_count = 0;
     let retry_interval = Duration::from_millis(500);
-    let max_retries = 20; // 10초 타임아웃
-
-    let mut buf = vec![0u8; 65535];
+    let max_retries = 20;
 
     while init_ack.is_none() && retry_count < max_retries {
-        // Init을 우선순위 큐로 전송
         let _ = priority_tx.send(init_request.to_bytes()).await;
 
         if retry_count > 0 {
             info!("Retry #{}: Waiting for InitAck...", retry_count);
         }
 
-        // 서버 응답 대기 (timeout 적용)
-        match tokio::time::timeout(retry_interval, socket.recv_from(&mut buf)).await {
-            Ok(Ok((len, _addr))) => {
-                // 메시지 파싱
-                if let Ok(header) = bincode::deserialize::<MessageHeader>(&buf[..len.min(32)]) {
+        // 수신 큐에서 읽기
+        let mut rx = recv_rx.lock().await;
+        match tokio::time::timeout(retry_interval, rx.recv()).await {
+            Ok(Some(buf)) => {
+                drop(rx);
+                if let Ok(header) = bincode::deserialize::<MessageHeader>(&buf[..buf.len().min(32)]) {
                     if header.msg_type == MessageType::InitAck {
-                        if let Some(resp) = InitAckMessage::from_bytes(&buf[..len]) {
+                        if let Some(resp) = InitAckMessage::from_bytes(&buf) {
                             init_ack = Some(resp);
                         }
                     }
                 }
             }
-            Ok(Err(e)) => {
-                warn!("Receive error: {}", e);
+            Ok(None) => {
+                drop(rx);
+                warn!("Receive channel closed");
             }
             Err(_) => {
-                // 타임아웃 - 재시도
+                drop(rx);
             }
         }
 
@@ -283,11 +298,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // 패킷 수신 (non-blocking with timeout)
-        match tokio::time::timeout(Duration::from_millis(50), socket.recv_from(&mut buf)).await {
-            Ok(Ok((len, _addr))) => {
+        // 패킷 수신 (수신 큐에서 읽기)
+        let mut rx = recv_rx.lock().await;
+        match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+            Ok(Some(buf)) => {
+                drop(rx);
                 // 청크 파싱
-                if let Some(chunk) = Chunk::from_bytes(&buf[..len]) {
+                if let Some(chunk) = Chunk::from_bytes(&buf) {
                     let seg_id = chunk.header.segment_id;
                     let chunk_id = chunk.header.chunk_id;
                     let total_chunks = chunk.header.total_chunks;
@@ -328,11 +345,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
-            Ok(Err(e)) => {
-                warn!("Receive error: {}", e);
+            Ok(None) => {
+                drop(rx);
             }
             Err(_) => {
-                // 타임아웃 - NACK 처리로 진행
+                drop(rx);
             }
         }
 
