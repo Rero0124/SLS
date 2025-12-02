@@ -8,6 +8,15 @@ UDP 기반 **NACK 블록 조립형** 전송 프로토콜 - Rust 구현
 - **블록/퍼즐 조립**: 스트림이 아닌 세그먼트 단위 전송
 - **Forward Redundancy**: 중복 전송으로 손실 보정
 - **저사양 최적화**: 클라이언트 부담 최소화
+- **BBR-lite 혼잡제어**: RTT/대역폭 기반 동적 pacing
+- **백프레셔**: 큐 기반 자동 흐름 제어
+
+## ⚡ 성능
+
+| 테스트 환경 | 처리량 | NACK 횟수 |
+|------------|--------|-----------|
+| 로컬 (2GB, 암호화) | **200+ MB/s** (서버) / 80 MB/s (수신) | ~1,200회 |
+| 로컬 (2GB, 비암호화) | **210+ MB/s** | ~1,000회 |
 
 ## 📦 구조
 
@@ -15,8 +24,10 @@ UDP 기반 **NACK 블록 조립형** 전송 프로토콜 - Rust 구현
 SLS/
 ├── src/
 │   ├── lib.rs           # 라이브러리 진입점
+│   ├── bbr.rs           # BBR-lite 혼잡제어
 │   ├── chunk.rs         # Segment/Chunk 정의
 │   ├── config.rs        # 프로토콜 설정
+│   ├── crypto.rs        # X25519 + ChaCha20-Poly1305 암호화
 │   ├── error.rs         # 에러 타입
 │   ├── message.rs       # 프로토콜 메시지 (NACK 등)
 │   ├── multipath.rs     # 멀티패스 관리
@@ -26,6 +37,8 @@ SLS/
 │   └── bin/
 │       ├── server.rs    # 서버 실행 파일
 │       └── client.rs    # 클라이언트 실행 파일
+├── examples/
+│   └── large_file_test.rs  # 대용량 파일 전송 테스트
 └── Cargo.toml
 ```
 
@@ -40,6 +53,10 @@ cargo run --release --bin sls-server -- --bind 0.0.0.0:9000 --file data.bin
 
 # 클라이언트 실행 (수신자)
 cargo run --release --bin sls-client -- --server 127.0.0.1:9000 --output received.bin
+
+# 대용량 파일 전송 테스트 (2GB, 암호화)
+cargo run --release --example large_file_test -- --server --size 2000 --encrypt
+cargo run --release --example large_file_test -- --client --encrypt
 ```
 
 ## 📊 프로토콜 개요
@@ -169,13 +186,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### 1. NACK 기반 블록 전송
 - ACK 없음 → 클라이언트 부담 최소화
 - 누락 청크만 요청 → 업링크 최소화
+- 청크 캐싱으로 재전송 시 재암호화 불필요
 
-### 2. PUEC (Punctual Unequal Chunking) 멀티패스
+### 2. BBR-lite 혼잡 제어
+```rust
+// RTT/대역폭 기반 동적 pacing rate 조정
+pub struct BbrLite {
+    pub pacing_rate: f64,   // bytes/sec (초기 300MB/s)
+    pub min_rtt: f64,       // 최소 RTT 추적
+    pub gain_up: f64,       // 10% probe-up
+    pub gain_down: f64,     // RTT 증가시 15% 감속
+}
+```
+
+### 3. 백프레셔 (Backpressure)
+```rust
+// 큐 용량 기반 자동 흐름 제어
+const MIN_CAPACITY: usize = 70_000;   // 이 이하면 대기
+const RESUME_CAPACITY: usize = 190_000; // 이 이상이면 재개
+```
+
+### 4. PUEC (Punctual Unequal Chunking) 멀티패스
 - NIC별 속도 측정 (chunk arrival rate)
 - 자동 비율 조정
 - 손실률 기반 중복률 계산
 
-### 3. Forward Redundancy
+### 5. Forward Redundancy
 - RTT 의존 없음
 - 실시간 고손실 대응
 - 네트워크 상태에 따른 동적 조정

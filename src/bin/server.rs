@@ -23,6 +23,7 @@ use tokio::sync::mpsc;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
+use sls::bbr::BbrLite;
 use sls::chunk::SegmentBuilder;
 use sls::message::{InitAckMessage, InitMessage, MessageHeader, MessageType, NackMessage};
 use sls::Config;
@@ -178,15 +179,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let segment_builder = Arc::new(SegmentBuilder::new(server_config.config.chunk_size));
     let config = server_config.config.clone();
 
-    // 세그먼트 데이터 캐시 (NACK 재전송용)
-    let segment_cache: Arc<tokio::sync::RwLock<std::collections::HashMap<u64, Vec<u8>>>> =
+    // 세그먼트 청크 캐시 (NACK 재전송용 - 이미 분할된 청크 저장)
+    let segment_chunks: Arc<tokio::sync::RwLock<std::collections::HashMap<u64, Vec<sls::chunk::Chunk>>>> =
         Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    
+    // BBR 혼잡 제어 (향후 동적 pacing용)
+    let _bbr = Arc::new(tokio::sync::Mutex::new(BbrLite::new(0.001, 300_000_000.0)));
 
     // ═══════════════════════════════════════════════════════════════
     // 송신 큐: 우선순위 큐 + 일반 데이터 큐
     // ═══════════════════════════════════════════════════════════════
     let (priority_tx, mut priority_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(1000);
-    let (data_tx, mut data_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(100_000);
+    let (data_tx, mut data_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(200_000);
 
     // ─────────────────────────────────────────────────────────────────
     // 송신 태스크: 우선순위 큐 먼저, 그 다음 일반 큐
@@ -281,7 +285,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let data_clone = data.clone();
                             let config_clone = config.clone();
                             let segment_builder_clone = segment_builder.clone();
-                            let segment_cache_clone = segment_cache.clone();
+                            let segment_chunks_clone = segment_chunks.clone();
                             let data_tx_clone = data_tx.clone();
                             let total_segments = (data.len() + config.segment_size - 1) / config.segment_size;
                             
@@ -297,17 +301,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let end = (offset + config_clone.segment_size).min(data_clone.len());
                                     let segment_data = &data_clone[offset..end];
 
-                                    // 세그먼트 캐시 저장
-                                    {
-                                        let mut cache = segment_cache_clone.write().await;
-                                        cache.insert(segment_id, segment_data.to_vec());
-                                    }
-
-                                    // 청크 분할 및 전송
+                                    // 청크 분할
                                     let chunks = segment_builder_clone.split_into_chunks(segment_id, segment_data, 0);
                                     let redundant_chunks = segment_builder_clone
                                         .create_redundant_chunks(&chunks, config_clone.base_redundancy_ratio);
 
+                                    // 청크 캐시 저장 (NACK 재전송용)
+                                    {
+                                        let mut cache = segment_chunks_clone.write().await;
+                                        cache.insert(segment_id, chunks.clone());
+                                    }
+
+                                    // 백프레셔: 큐가 가득 차면 대기
+                                    const MIN_CAPACITY: usize = 70_000;
+                                    const RESUME_CAPACITY: usize = 190_000;
+                                    while data_tx_clone.capacity() < MIN_CAPACITY {
+                                        tokio::time::sleep(std::time::Duration::from_micros(100)).await;
+                                        if data_tx_clone.capacity() >= RESUME_CAPACITY {
+                                            break;
+                                        }
+                                    }
+
+                                    // 청크 전송
                                     for chunk in chunks.iter().chain(redundant_chunks.iter()) {
                                         let bytes = chunk.to_bytes();
                                         if data_tx_clone.send((bytes, addr)).await.is_err() {
@@ -345,24 +360,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 MessageType::Nack => {
-                    // NACK 처리 - 재전송
+                    // NACK 처리 - 캐시된 청크로 즉시 재전송
                     if let Some(nack) = NackMessage::from_bytes(&buf[..len]) {
-                        let segment_builder_clone = segment_builder.clone();
-                        let segment_cache_clone = segment_cache.clone();
+                        let segment_chunks_clone = segment_chunks.clone();
                         let data_tx_clone = data_tx.clone();
                         
-                        // 재전송도 별도 태스크로 처리
                         tokio::spawn(async move {
-                            let cache = segment_cache_clone.read().await;
-                            if let Some(segment_data) = cache.get(&nack.segment_id) {
-                                let chunks = segment_builder_clone.split_into_chunks(
-                                    nack.segment_id,
-                                    segment_data,
-                                    0,
-                                );
-
+                            let cache = segment_chunks_clone.read().await;
+                            if let Some(chunks) = cache.get(&nack.segment_id) {
                                 for &chunk_id in &nack.missing_chunk_ids {
-                                    if let Some(chunk) = chunks.iter().find(|c| c.header.chunk_id == chunk_id) {
+                                    if let Some(chunk) = chunks.get(chunk_id as usize) {
                                         let bytes = chunk.to_bytes();
                                         let _ = data_tx_clone.send((bytes, addr)).await;
                                     }
