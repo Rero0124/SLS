@@ -18,6 +18,7 @@ pub mod multipath;
 pub mod receiver;
 pub mod sender;
 pub mod stats;
+pub mod bbr;
 
 pub use chunk::{Chunk, ChunkId, Segment, SegmentId, SegmentBuilder};
 pub use config::Config;

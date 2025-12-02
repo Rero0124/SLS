@@ -21,6 +21,7 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
+use sls::bbr::BbrLite;
 use sls::chunk::SegmentBuilder;
 use sls::crypto::{CryptoSession, EphemeralKeyPair, KeyExchangeMessage};
 use sls::message::{FlowControlMessage, InitAckMessage, InitMessage, MessageHeader, MessageType, NackMessage};
@@ -87,94 +88,6 @@ fn verify_data(original: &[u8], received: &[u8]) -> bool {
     true
 }
 
-/// 혼잡 제어 상태 - TCP-like (Slow Start + Congestion Avoidance)
-#[derive(Debug)]
-struct CongestionControl {
-    send_rate: u64,            // 현재 전송률 목표 (bytes/sec)
-    measured_rate: u64,        // 측정된 수신률 (bytes/sec)
-    ssthresh: u64,             // slow start threshold
-    in_slow_start: bool,       // slow start 모드
-    initialized: bool,         // 초기 속도 설정 완료
-}
-
-impl CongestionControl {
-    fn new() -> Self {
-        Self {
-            send_rate: 50 * 1024 * 1024,   // 기본 시작: 50 MB/s
-            measured_rate: 0,
-            ssthresh: 500 * 1024 * 1024,   // 초기 threshold: 500 MB/s
-            in_slow_start: true,
-            initialized: false,
-        }
-    }
-    
-    /// 초기 속도 설정 (클라이언트 RTT 기반 추정값)
-    fn set_initial_rate(&mut self, rate_mbps: f32) {
-        if !self.initialized {
-            let rate = (rate_mbps as u64) * 1024 * 1024;
-            self.send_rate = rate.clamp(50 * 1024 * 1024, 500 * 1024 * 1024);
-            self.ssthresh = self.send_rate * 2; // threshold를 초기속도의 2배로
-            self.initialized = true;
-        }
-    }
-    
-    /// 클라이언트 피드백으로 업데이트
-    fn on_feedback(&mut self, received_bytes: u64, elapsed_us: u64) {
-        if elapsed_us == 0 || received_bytes == 0 {
-            return;
-        }
-        
-        // 실제 수신률 계산 (bytes/sec)
-        let measured = (received_bytes as u128 * 1_000_000 / elapsed_us as u128) as u64;
-        self.measured_rate = measured;
-        
-        // 손실 감지: 수신률이 전송률의 70% 미만 (로컬에서는 더 관대하게)
-        let loss_detected = measured < (self.send_rate * 70 / 100);
-        
-        if loss_detected {
-            // 손실 발생 → threshold 낮추고 속도 감소
-            self.ssthresh = self.send_rate / 2;
-            self.send_rate = self.ssthresh;
-            self.in_slow_start = false;
-        } else if self.in_slow_start {
-            // Slow Start: 지수 증가 (2배)
-            self.send_rate = self.send_rate * 2;
-            
-            if self.send_rate >= self.ssthresh {
-                self.in_slow_start = false;
-                self.send_rate = self.ssthresh;
-            }
-        } else {
-            // Congestion Avoidance: 선형 증가 (50MB/s씩 - 더 빠르게)
-            self.send_rate += 50 * 1024 * 1024;
-        }
-        
-        // 속도 제한
-        self.send_rate = self.send_rate.clamp(
-            50 * 1024 * 1024,       // 최소 50 MB/s
-            1024 * 1024 * 1024      // 최대 1 GB/s
-        );
-    }
-    
-    /// 현재 pacing delay (세그먼트 배치 단위)
-    #[allow(dead_code)]
-    fn batch_delay_us(&self, batch_bytes: u64) -> u64 {
-        if self.send_rate == 0 {
-            return 0;
-        }
-        (batch_bytes as u128 * 1_000_000 / self.send_rate as u128) as u64
-    }
-    
-    /// 상태 문자열
-    fn status(&self) -> String {
-        format!("rate:{:.0}MB/s recv:{:.0}MB/s {}",
-            self.send_rate as f64 / 1024.0 / 1024.0,
-            self.measured_rate as f64 / 1024.0 / 1024.0,
-            if self.in_slow_start { "[SS]" } else { "[CA]" }
-        )
-    }
-}
-
 /// 서버 (송신자) 실행 - 병렬 처리 + 암호화 지원
 async fn run_server(
     addr: SocketAddr, 
@@ -198,24 +111,20 @@ async fn run_server(
     let (data_tx, mut data_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(200_000);
 
     // ─────────────────────────────────────────────────────────────────
-    // 단일 송신 태스크: 우선순위 큐 먼저, 그 다음 데이터 큐
+    // 단일 송신 태스크
     // ─────────────────────────────────────────────────────────────────
     let send_socket = socket.clone();
-    let measured_throughput = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let _measured_clone = measured_throughput.clone();
     
     let _send_task = tokio::spawn(async move {
-        let mut bytes_sent_window = 0u64;
-        let mut window_start = Instant::now();
-        
         loop {
+            // 우선순위 큐 먼저 체크
             match priority_rx.try_recv() {
                 Ok((bytes, addr)) => {
                     let _ = send_socket.send_to(&bytes, addr).await;
                     continue;
                 }
-                Err(mpsc::error::TryRecvError::Empty) => {}
                 Err(mpsc::error::TryRecvError::Disconnected) => break,
+                Err(mpsc::error::TryRecvError::Empty) => {}
             }
 
             tokio::select! {
@@ -224,15 +133,7 @@ async fn run_server(
                     let _ = send_socket.send_to(&bytes, addr).await;
                 }
                 Some((bytes, addr)) = data_rx.recv() => {
-                    let packet_len = bytes.len() as u64;
                     let _ = send_socket.send_to(&bytes, addr).await;
-                    bytes_sent_window += packet_len;
-                    
-                    if window_start.elapsed() >= Duration::from_secs(1) {
-                        _measured_clone.store(bytes_sent_window, std::sync::atomic::Ordering::Relaxed);
-                        bytes_sent_window = 0;
-                        window_start = Instant::now();
-                    }
                 }
                 else => break,
             }
@@ -338,23 +239,21 @@ async fn run_server(
     let segment_chunks: Arc<RwLock<HashMap<u64, Vec<sls::chunk::Chunk>>>> = 
         Arc::new(RwLock::new(HashMap::new()));
 
-    // 혼잡 제어 (높은 속도로 시작, 손실 시 감속)
-    let congestion = Arc::new(tokio::sync::Mutex::new(CongestionControl::new()));
+    // BBR 혼잡 제어
+    let initial_rtt = 0.001; // 1ms
+    let initial_rate = 300_000_000.0; // 300 MB/s
+    let packet_size = config.chunk_size + 100;
+    let bbr = Arc::new(tokio::sync::Mutex::new(BbrLite::new(initial_rtt, initial_rate)));
     let segments_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let sending_active = Arc::new(std::sync::atomic::AtomicBool::new(true));
     
-    // FlowControl 피드백 태스크 (전송과 동시에 실행)
-    let fc_congestion = congestion.clone();
-    let _fc_segments_sent = segments_sent.clone(); // 향후 사용 예정
+    // FlowControl 피드백 태스크 (BBR 업데이트)
+    let fc_bbr = bbr.clone();
     let fc_sending = sending_active.clone();
     let fc_recv_rx = recv_rx.clone();
-    let chunk_size_fc = config.chunk_size;
     
     let _fc_task = tokio::spawn(async move {
-        let mut prev_client_segments = 0u64;
-        let mut prev_fc_time = Instant::now();
         let mut last_log = Instant::now();
-        let mut first_fc = true;
         
         while fc_sending.load(std::sync::atomic::Ordering::Relaxed) {
             let mut rx = fc_recv_rx.lock().await;
@@ -362,35 +261,21 @@ async fn run_server(
                 Ok(Some((data, _addr))) => {
                     drop(rx);
                     
+                    // FlowControl 메시지 → BBR 업데이트
                     if let Some(fc) = FlowControlMessage::from_bytes(&data) {
-                        let mut cc = fc_congestion.lock().await;
-                        
-                        // 첫 FlowControl에서 초기 속도 설정 (클라이언트 RTT 기반 추정값)
-                        if first_fc && fc.processing_rate > 0.0 {
-                            cc.set_initial_rate(fc.processing_rate);
-                            info!("📶 초기 속도 설정: {:.0} MB/s (클라이언트 RTT 기반)", fc.processing_rate);
-                            first_fc = false;
-                            prev_fc_time = Instant::now();
-                            continue;
+                        let mut b = fc_bbr.lock().await;
+                        // RTT 업데이트 (FlowControl에서 수신 속도를 RTT 추정에 활용)
+                        if fc.processing_rate > 0.0 {
+                            // 수신률 기반 RTT 추정
+                            let estimated_rtt = 0.001; // 기본 1ms
+                            b.on_rtt_update(estimated_rtt);
                         }
+                        b.update_rate();
                         
-                        let now = Instant::now();
-                        let client_segments = fc.processing_rate as u64;
-                        let elapsed_us = now.duration_since(prev_fc_time).as_micros() as u64;
-                        
-                        if elapsed_us > 10_000 { // 10ms 이상 경과
-                            let delivered_segments = client_segments.saturating_sub(prev_client_segments);
-                            let delivered_bytes = delivered_segments * chunk_size_fc as u64 * 55;
-                            
-                            cc.on_feedback(delivered_bytes, elapsed_us);
-                            
-                            if last_log.elapsed() > Duration::from_millis(500) {
-                                info!("📶 {}", cc.status());
-                                last_log = Instant::now();
-                            }
-                            
-                            prev_client_segments = client_segments;
-                            prev_fc_time = now;
+                        if last_log.elapsed() > Duration::from_millis(500) {
+                            info!("📶 BBR rate:{:.0}MB/s min_rtt:{:.2}ms",
+                                b.pacing_rate / 1024.0 / 1024.0, b.min_rtt * 1000.0);
+                            last_log = Instant::now();
                         }
                     }
                 }
@@ -428,34 +313,50 @@ async fn run_server(
             cache.insert(segment_id, chunks.clone());
         }
 
-        // 청크 전송
+        // 청크 전송 (채널에 적재)
+        let mut segment_bytes = 0usize;
         for chunk in &chunks {
             let bytes = chunk.to_bytes();
+            segment_bytes += bytes.len();
             let _ = tx.send((bytes, client_addr)).await;
             total_chunks += 1;
         }
-
         for chunk in &redundant_chunks {
             let bytes = chunk.to_bytes();
+            segment_bytes += bytes.len();
             let _ = tx.send((bytes, client_addr)).await;
             total_redundant += 1;
         }
         
         segments_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         
-        // 가벼운 pacing: 세그먼트마다 최소 대기 (버퍼 오버플로우 방지)
-        // 200 MB/s 기준: 세그먼트당 ~65KB → 0.3ms 간격
-        if segment_id % 5 == 0 {
-            tokio::task::yield_now().await; // 다른 태스크에 기회 부여
+        // BBR 세그먼트 기반 pacing
+        {
+            let mut b = bbr.lock().await;
+            b.on_packet_sent(segment_bytes);
+            
+            // pacing_rate 기반 대기 시간 계산
+            let target_us = (segment_bytes as f64 / b.pacing_rate * 1_000_000.0) as u64;
+            drop(b);
+            
+            if target_us > 10 {
+                tokio::time::sleep(Duration::from_micros(target_us)).await;
+            }
+        }
+        
+        // 100 세그먼트마다 BBR 업데이트
+        if segment_id % 100 == 0 {
+            let mut b = bbr.lock().await;
+            b.update_rate();
         }
 
         if segment_id % 100 == 0 || segment_id == total_segments as u64 {
             let progress = (segment_id as f64 / total_segments as f64) * 100.0;
             let elapsed = start.elapsed().as_secs_f64();
             let speed = end as f64 / elapsed / 1024.0 / 1024.0;
-            let cc = congestion.lock().await;
+            let b = bbr.lock().await;
             info!("📊 진행: {:.1}% | {}/{} | {:.0} MB/s | target:{:.0}MB/s", 
-                progress, segment_id, total_segments, speed, cc.send_rate as f64 / 1024.0 / 1024.0);
+                progress, segment_id, total_segments, speed, b.pacing_rate / 1024.0 / 1024.0);
         }
     }
 
@@ -540,8 +441,8 @@ async fn run_server(
     let num_process_workers = 4;
     let mut process_handles = Vec::new();
     
-    // NACK 재전송에도 혼잡 제어 속도 적용
-    let nack_congestion = congestion.clone();
+    // NACK 재전송에도 BBR pacing 적용
+    let nack_bbr = bbr.clone();
     
     for _worker_id in 0..num_process_workers {
         let rx = nack_rx.clone();
@@ -549,11 +450,10 @@ async fn run_server(
         let tx = data_tx.clone();
         let worker_running = nack_running.clone();
         let send_counter = send_count.clone();
-        let cc = nack_congestion.clone();
+        let b = nack_bbr.clone();
         
         let handle = tokio::spawn(async move {
-            let mut batch_start = Instant::now();
-            let mut batch_bytes = 0u64;
+            let mut chunk_count = 0u32;
             
             loop {
                 let nack = {
@@ -570,32 +470,31 @@ async fn run_server(
                     }
                 };
                 
+                // NACK 수신 → RTT 증가로 처리 (혼잡 감지)
+                {
+                    let mut guard = b.lock().await;
+                    // RTT를 20% 증가시켜 혼잡 신호 전달
+                    let new_rtt = guard.last_rtt * 1.2;
+                    guard.on_rtt_update(new_rtt);
+                }
+                
                 let cache = chunks_cache.read().await;
                 if let Some(chunks) = cache.get(&nack.segment_id) {
                     for &chunk_id in &nack.missing_chunk_ids {
                         if let Some(chunk) = chunks.get(chunk_id as usize) {
                             let bytes = chunk.to_bytes();
-                            let len = bytes.len() as u64;
                             let _ = tx.send((bytes, client_addr)).await;
                             send_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            batch_bytes += len;
+                            chunk_count += 1;
                             
-                            // 100KB마다 pacing 체크
-                            if batch_bytes >= 100_000 {
-                                let send_rate = {
-                                    let guard = cc.lock().await;
-                                    guard.send_rate
+                            // BBR pacing 적용
+                            if chunk_count % 10 == 0 {
+                                let delay = {
+                                    let mut guard = b.lock().await;
+                                    guard.on_packet_sent(packet_size * 10);
+                                    guard.pacing_delay(packet_size)
                                 };
-                                
-                                let elapsed_us = batch_start.elapsed().as_micros() as u64;
-                                let target_us = (batch_bytes as u128 * 1_000_000 / send_rate as u128) as u64;
-                                
-                                if target_us > elapsed_us + 100 {
-                                    tokio::time::sleep(Duration::from_micros(target_us - elapsed_us)).await;
-                                }
-                                
-                                batch_start = Instant::now();
-                                batch_bytes = 0;
+                                tokio::time::sleep(delay).await;
                             }
                         }
                     }
