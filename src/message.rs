@@ -39,6 +39,7 @@ pub enum MessageType {
 
     /// 흐름 제어 피드백 (클라이언트 → 서버)
     FlowControl = 10,
+
 }
 
 /// 메시지 헤더
@@ -168,29 +169,44 @@ impl SegmentCompleteMessage {
     }
 }
 
-/// 연결 초기화 메시지
+/// 연결 초기화 메시지 (클라이언트 → 서버)
+///
+/// 클라이언트가 서버에 연결 시 보내는 초기 핸드쉐이크 메시지
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InitMessage {
+    /// 클라이언트 공개키 (X25519, 32바이트)
+    /// 암호화 비활성 시 0으로 채움
+    pub client_public_key: [u8; 32],
+    
+    /// 암호화 활성화 요청 여부
+    pub encryption_enabled: bool,
+
     /// 클라이언트가 지원하는 NIC 수
     pub nic_count: u8,
 
-    /// 요청 청크 크기
+    /// 요청 청크 크기 (0이면 서버 기본값 사용)
     pub chunk_size: u16,
 
-    /// 요청 세그먼트 크기
+    /// 요청 세그먼트 크기 (0이면 서버 기본값 사용)
     pub segment_size: u32,
 
-    /// 버퍼 크기 힌트
+    /// 버퍼 크기 힌트 (바이트)
     pub buffer_size: u32,
+    
+    /// 프로토콜 버전
+    pub protocol_version: u8,
 }
 
 impl InitMessage {
-    pub fn new(nic_count: u8) -> Self {
+    pub fn new(encryption_enabled: bool, client_public_key: [u8; 32]) -> Self {
         Self {
-            nic_count,
-            chunk_size: 1200,
-            segment_size: 65536,
+            client_public_key,
+            encryption_enabled,
+            nic_count: 1,
+            chunk_size: 0, // 서버 기본값 사용
+            segment_size: 0, // 서버 기본값 사용
             buffer_size: 2 * 1024 * 1024,
+            protocol_version: crate::PROTOCOL_VERSION,
         }
     }
 
@@ -206,17 +222,44 @@ impl InitMessage {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        let header_size = 16; // 대략적 헤더 크기
+        if bytes.len() < 10 {
+            return None;
+        }
+        
+        let header: MessageHeader = bincode::deserialize(bytes).ok()?;
+        if header.msg_type != MessageType::Init {
+            return None;
+        }
+        
+        let header_bytes = bincode::serialize(&header).ok()?;
+        let header_size = header_bytes.len();
+        
         if bytes.len() < header_size {
             return None;
         }
+        
         bincode::deserialize(&bytes[header_size..]).ok()
     }
 }
 
-/// 연결 초기화 응답
+/// 연결 초기화 응답 (서버 → 클라이언트)
+///
+/// 서버가 클라이언트의 Init에 응답하여 보내는 메시지
+/// 이 메시지를 받으면 클라이언트는 데이터 수신 준비 완료
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InitAckMessage {
+    /// 서버 공개키 (X25519, 32바이트)
+    /// 암호화 비활성 시 0으로 채움
+    pub server_public_key: [u8; 32],
+    
+    /// 세션 키 (ChaCha20-Poly1305, 32바이트)
+    /// 암호화 비활성 시 0으로 채움
+    /// 실제 구현에서는 ECDH로 유도해야 함
+    pub session_key: [u8; 32],
+    
+    /// 암호화 활성화 여부
+    pub encryption_enabled: bool,
+
     /// 서버가 결정한 NIC 수
     pub nic_count: u8,
 
@@ -228,9 +271,45 @@ pub struct InitAckMessage {
 
     /// 서버 기본 중복률
     pub redundancy_ratio: f32,
+    
+    /// 전송할 총 파일 크기 (바이트)
+    pub total_file_size: u64,
+    
+    /// 총 세그먼트 수
+    pub total_segments: u64,
+    
+    /// 세그먼트당 청크 수
+    pub chunks_per_segment: u32,
+    
+    /// 프로토콜 버전
+    pub protocol_version: u8,
 }
 
 impl InitAckMessage {
+    pub fn new(
+        total_file_size: u64,
+        chunk_size: u16,
+        segment_size: u32,
+        redundancy_ratio: f32,
+    ) -> Self {
+        let chunks_per_segment = (segment_size as usize / chunk_size as usize) as u32;
+        let total_segments = (total_file_size + segment_size as u64 - 1) / segment_size as u64;
+        
+        Self {
+            server_public_key: [0u8; 32],
+            session_key: [0u8; 32],
+            encryption_enabled: false,
+            nic_count: 1,
+            chunk_size,
+            segment_size,
+            redundancy_ratio,
+            total_file_size,
+            total_segments,
+            chunks_per_segment,
+            protocol_version: crate::PROTOCOL_VERSION,
+        }
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let payload = bincode::serialize(self).unwrap_or_default();
         let header = MessageHeader::new(MessageType::InitAck, payload.len() as u32);
@@ -243,7 +322,6 @@ impl InitAckMessage {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        // 헤더 파싱해서 실제 크기 확인
         if bytes.len() < 10 {
             return None;
         }
@@ -253,7 +331,6 @@ impl InitAckMessage {
             return None;
         }
         
-        // 헤더 크기 계산
         let header_bytes = bincode::serialize(&header).ok()?;
         let header_size = header_bytes.len();
         

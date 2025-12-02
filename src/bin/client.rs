@@ -14,15 +14,19 @@
 //!   # 예상 크기 지정
 //!   cargo run --release --bin sls_client -- -s 127.0.0.1:9000 -o data.bin --size 104857600
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use tracing::{info, Level};
+use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
+use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use sls::multipath::PathManager;
-use sls::receiver::Receiver;
+use sls::chunk::Chunk;
+use sls::message::{InitAckMessage, InitMessage, MessageHeader, MessageType, NackMessage};
 use sls::Config;
 
 /// 클라이언트 설정
@@ -147,86 +151,285 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Server address: {}", client_config.server_addr);
     info!("Bind address: {}", client_config.bind_addr);
 
-    // PathManager 생성
-    let path_manager = Arc::new(PathManager::new(client_config.config.clone()));
+    // UDP 소켓 바인딩
+    let socket = Arc::new(UdpSocket::bind(client_config.bind_addr).await?);
+    let local_addr = socket.local_addr()?;
+    info!("Bound to local address: {}", local_addr);
 
-    // 수신자 시작
-    let (receiver, mut segment_rx) = Receiver::start(
-        client_config.config.clone(),
-        client_config.bind_addr,
-        client_config.server_addr,
-        path_manager,
-    )
-    .await?;
+    let server_addr = client_config.server_addr;
 
-    info!("Connected to server, waiting for data...");
+    // ═══════════════════════════════════════════════════════════════
+    // 송신 큐: 우선순위 큐 (Init, NACK) + 일반 큐 (기타)
+    // ═══════════════════════════════════════════════════════════════
+    let (priority_tx, mut priority_rx) = mpsc::channel::<Vec<u8>>(1000);
+    let (_data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(10_000);
 
-    let start = std::time::Instant::now();
-    let mut received_data = Vec::new();
-    let mut segment_count = 0u64;
+    // 송신 태스크: 우선순위 큐 먼저
+    let send_socket = socket.clone();
+    let _send_task = tokio::spawn(async move {
+        loop {
+            // 1. 우선순위 큐 확인 (non-blocking)
+            match priority_rx.try_recv() {
+                Ok(bytes) => {
+                    let _ = send_socket.send_to(&bytes, server_addr).await;
+                    continue;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
 
-    // 데이터 수신
-    loop {
-        tokio::select! {
-            segment = segment_rx.recv() => {
-                match segment {
-                    Some((segment_id, data)) => {
-                        segment_count += 1;
-                        info!(
-                            "Received segment {}: {} bytes (total: {} bytes)",
-                            segment_id,
-                            data.len(),
-                            received_data.len() + data.len()
-                        );
+            // 2. 양쪽 큐 모두 확인
+            tokio::select! {
+                Some(bytes) = priority_rx.recv() => {
+                    let _ = send_socket.send_to(&bytes, server_addr).await;
+                }
+                Some(bytes) = data_rx.recv() => {
+                    let _ = send_socket.send_to(&bytes, server_addr).await;
+                }
+                else => break,
+            }
+        }
+    });
 
-                        received_data.extend_from_slice(&data);
+    // 초기화 메시지 생성
+    let init_request = InitMessage::new(
+        client_config.encrypt,
+        [0u8; 32], // TODO: 실제 공개키 생성
+    );
 
-                        // 예상 크기에 도달하면 종료
-                        if let Some(expected) = client_config.expected_size {
-                            if received_data.len() >= expected {
-                                info!("Expected size reached, stopping...");
-                                break;
-                            }
+    // === Phase 1: 핸드쉐이크 (Init/InitAck) ===
+    info!("Sending Init to server (via priority queue)...");
+    let mut init_ack: Option<InitAckMessage> = None;
+    let mut retry_count = 0;
+    let retry_interval = Duration::from_millis(500);
+    let max_retries = 20; // 10초 타임아웃
+
+    let mut buf = vec![0u8; 65535];
+
+    while init_ack.is_none() && retry_count < max_retries {
+        // Init을 우선순위 큐로 전송
+        let _ = priority_tx.send(init_request.to_bytes()).await;
+
+        if retry_count > 0 {
+            info!("Retry #{}: Waiting for InitAck...", retry_count);
+        }
+
+        // 서버 응답 대기 (timeout 적용)
+        match tokio::time::timeout(retry_interval, socket.recv_from(&mut buf)).await {
+            Ok(Ok((len, _addr))) => {
+                // 메시지 파싱
+                if let Ok(header) = bincode::deserialize::<MessageHeader>(&buf[..len.min(32)]) {
+                    if header.msg_type == MessageType::InitAck {
+                        if let Some(resp) = InitAckMessage::from_bytes(&buf[..len]) {
+                            init_ack = Some(resp);
                         }
                     }
-                    None => {
-                        info!("Channel closed");
-                        break;
+                }
+            }
+            Ok(Err(e)) => {
+                warn!("Receive error: {}", e);
+            }
+            Err(_) => {
+                // 타임아웃 - 재시도
+            }
+        }
+
+        retry_count += 1;
+    }
+
+    let metadata = init_ack.ok_or("Failed to receive InitAck from server")?;
+
+    info!("InitAck received:");
+    info!("  Total file size: {} bytes", metadata.total_file_size);
+    info!("  Total segments: {}", metadata.total_segments);
+    info!("  Chunks per segment: {}", metadata.chunks_per_segment);
+    info!("  Chunk size: {} bytes", metadata.chunk_size);
+    info!("  Segment size: {} bytes", metadata.segment_size);
+    info!("  Encryption: {}", metadata.encryption_enabled);
+
+    // === Phase 2: 데이터 수신 ===
+    info!("Starting data reception...");
+    let start = Instant::now();
+
+    // 세그먼트별 청크 수신 상태
+    // segment_id -> (received_chunks: HashMap<chunk_id, data>, total_chunks)
+    let mut segment_chunks: HashMap<u64, (HashMap<u32, Vec<u8>>, u32)> = HashMap::new();
+    let mut completed_segments: HashMap<u64, Vec<u8>> = HashMap::new();
+    let mut total_chunks_received = 0u64;
+    let mut total_nacks_sent = 0u64;
+
+    let total_segments = metadata.total_segments;
+    let chunks_per_segment = metadata.chunks_per_segment;
+
+    // NACK 타이밍
+    let mut last_nack_time = Instant::now();
+    let nack_interval = Duration::from_millis(200);
+    let mut last_progress_time = Instant::now();
+
+    // 수신 루프
+    loop {
+        // 완료 조건 체크
+        if completed_segments.len() as u64 >= total_segments {
+            info!("All {} segments received!", total_segments);
+            break;
+        }
+
+        // 예상 크기 도달 체크
+        let total_received_bytes: usize = completed_segments.values().map(|v| v.len()).sum();
+        if let Some(expected) = client_config.expected_size {
+            if total_received_bytes >= expected {
+                info!("Expected size reached!");
+                break;
+            }
+        }
+
+        // 패킷 수신 (non-blocking with timeout)
+        match tokio::time::timeout(Duration::from_millis(50), socket.recv_from(&mut buf)).await {
+            Ok(Ok((len, _addr))) => {
+                // 청크 파싱
+                if let Some(chunk) = Chunk::from_bytes(&buf[..len]) {
+                    let seg_id = chunk.header.segment_id;
+                    let chunk_id = chunk.header.chunk_id;
+                    let total_chunks = chunk.header.total_chunks;
+
+                    // 이미 완료된 세그먼트 스킵
+                    if completed_segments.contains_key(&seg_id) {
+                        continue;
+                    }
+
+                    // 세그먼트 청크 저장
+                    let entry = segment_chunks
+                        .entry(seg_id)
+                        .or_insert_with(|| (HashMap::new(), total_chunks));
+                    
+                    if !entry.0.contains_key(&chunk_id) {
+                        entry.0.insert(chunk_id, chunk.data.to_vec());
+                        total_chunks_received += 1;
+                    }
+
+                    // 세그먼트 완료 체크
+                    if entry.0.len() as u32 == total_chunks {
+                        // 세그먼트 조립
+                        let mut segment_data = vec![0u8; metadata.segment_size as usize];
+                        for (&cid, data) in &entry.0 {
+                            let offset = cid as usize * metadata.chunk_size as usize;
+                            let end = (offset + data.len()).min(segment_data.len());
+                            segment_data[offset..end].copy_from_slice(&data[..end - offset]);
+                        }
+                        // 마지막 세그먼트는 크기가 다를 수 있음
+                        if seg_id == total_segments {
+                            let last_seg_size = (metadata.total_file_size % metadata.segment_size as u64) as usize;
+                            if last_seg_size > 0 {
+                                segment_data.truncate(last_seg_size);
+                            }
+                        }
+                        completed_segments.insert(seg_id, segment_data);
+                        segment_chunks.remove(&seg_id);
                     }
                 }
             }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-                // 10초 타임아웃
-                if segment_count > 0 {
-                    info!("No more data received, assuming transfer complete");
-                    break;
+            Ok(Err(e)) => {
+                warn!("Receive error: {}", e);
+            }
+            Err(_) => {
+                // 타임아웃 - NACK 처리로 진행
+            }
+        }
+
+        // 진행률 로깅 (2초마다)
+        if last_progress_time.elapsed() > Duration::from_secs(2) {
+            let progress = (completed_segments.len() as f64 / total_segments as f64) * 100.0;
+            info!(
+                "Progress: {}/{} segments ({:.1}%), {} chunks received",
+                completed_segments.len(),
+                total_segments,
+                progress,
+                total_chunks_received
+            );
+            last_progress_time = Instant::now();
+        }
+
+        // NACK 전송 (주기적) - 우선순위 큐 사용
+        if last_nack_time.elapsed() > nack_interval {
+            let mut nack_count = 0;
+            let mut total_missing_chunks = 0;
+
+            // 부분 수신된 세그먼트의 누락 청크 요청
+            for (&seg_id, (received, total)) in &segment_chunks {
+                let missing: Vec<u32> = (0..*total)
+                    .filter(|id| !received.contains_key(id))
+                    .collect();
+
+                if !missing.is_empty() {
+                    let nack = NackMessage::new(seg_id, missing.clone(), 0.0, 0);
+                    // NACK은 우선순위 큐로 전송
+                    let _ = priority_tx.send(nack.to_bytes()).await;
+                    nack_count += 1;
+                    total_missing_chunks += missing.len();
+                    total_nacks_sent += 1;
                 }
             }
+
+            // 아예 수신되지 않은 세그먼트 요청
+            for seg_id in 1..=total_segments {
+                if !completed_segments.contains_key(&seg_id) && !segment_chunks.contains_key(&seg_id) {
+                    // 모든 청크 요청
+                    let missing: Vec<u32> = (0..chunks_per_segment).collect();
+                    let nack = NackMessage::new(seg_id, missing.clone(), 0.0, 0);
+                    // NACK은 우선순위 큐로 전송
+                    let _ = priority_tx.send(nack.to_bytes()).await;
+                    nack_count += 1;
+                    total_missing_chunks += missing.len();
+                    total_nacks_sent += 1;
+                }
+            }
+
+            if nack_count > 0 {
+                info!(
+                    "Sent {} NACKs for {} missing chunks (via priority queue)",
+                    nack_count, total_missing_chunks
+                );
+            }
+
+            last_nack_time = Instant::now();
+        }
+
+        // 타임아웃 체크 (30초 동안 진행 없으면 종료)
+        if start.elapsed() > Duration::from_secs(30) && completed_segments.is_empty() {
+            warn!("Timeout: No data received");
+            break;
         }
     }
 
+    // === 결과 정리 ===
     let elapsed = start.elapsed();
-    let stats = receiver.get_stats().await;
+
+    // 데이터 조립 (세그먼트 순서대로)
+    let mut received_data = Vec::new();
+    for seg_id in 1..=total_segments {
+        if let Some(data) = completed_segments.get(&seg_id) {
+            received_data.extend_from_slice(data);
+        }
+    }
 
     info!("Transfer complete!");
     info!("  Time: {:.2}s", elapsed.as_secs_f64());
-    info!("  Segments received: {}", segment_count);
+    info!("  Segments received: {}/{}", completed_segments.len(), total_segments);
     info!("  Total bytes: {}", received_data.len());
-    info!(
-        "  Throughput: {:.2} MB/s",
-        received_data.len() as f64 / elapsed.as_secs_f64() / 1_000_000.0
-    );
-    info!("  NACKs sent: {}", stats.total_nacks);
-    info!("  Loss rate: {:.2}%", stats.overall_loss_rate() * 100.0);
+    if elapsed.as_secs_f64() > 0.0 {
+        info!(
+            "  Throughput: {:.2} MB/s",
+            received_data.len() as f64 / elapsed.as_secs_f64() / 1_000_000.0
+        );
+    }
+    info!("  Total chunks: {}", total_chunks_received);
+    info!("  NACKs sent: {}", total_nacks_sent);
 
     // 파일 저장
     if let Some(output_path) = &client_config.output_path {
         std::fs::write(output_path, &received_data)?;
         info!("Data saved to {:?}", output_path);
     }
-
-    // 수신자 정지
-    receiver.stop().await;
 
     Ok(())
 }

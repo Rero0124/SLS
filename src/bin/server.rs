@@ -17,14 +17,14 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use sls::chunk::SegmentBuilder;
-use sls::message::{InitAckMessage, MessageHeader, MessageType, NackMessage};
+use sls::message::{InitAckMessage, InitMessage, MessageHeader, MessageType, NackMessage};
 use sls::Config;
 
 /// 서버 설정
@@ -175,14 +175,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Server listening on {}", server_config.bind_addr);
 
     // 세그먼트 빌더
-    let segment_builder = SegmentBuilder::new(server_config.config.chunk_size);
-    let config = server_config.config;
+    let segment_builder = Arc::new(SegmentBuilder::new(server_config.config.chunk_size));
+    let config = server_config.config.clone();
 
-    // 클라이언트 연결 대기
+    // 세그먼트 데이터 캐시 (NACK 재전송용)
+    let segment_cache: Arc<tokio::sync::RwLock<std::collections::HashMap<u64, Vec<u8>>>> =
+        Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+
+    // ═══════════════════════════════════════════════════════════════
+    // 송신 큐: 우선순위 큐 + 일반 데이터 큐
+    // ═══════════════════════════════════════════════════════════════
+    let (priority_tx, mut priority_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(1000);
+    let (data_tx, mut data_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(100_000);
+
+    // ─────────────────────────────────────────────────────────────────
+    // 송신 태스크: 우선순위 큐 먼저, 그 다음 일반 큐
+    // ─────────────────────────────────────────────────────────────────
+    let send_socket = socket.clone();
+    let _send_task = tokio::spawn(async move {
+        loop {
+            // 1. 우선순위 큐 확인 (non-blocking)
+            match priority_rx.try_recv() {
+                Ok((bytes, addr)) => {
+                    let _ = send_socket.send_to(&bytes, addr).await;
+                    continue; // 우선순위 큐에 더 있을 수 있으므로 다시 확인
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
+
+            // 2. 일반 큐 확인 (짧은 타임아웃)
+            tokio::select! {
+                Some((bytes, addr)) = priority_rx.recv() => {
+                    let _ = send_socket.send_to(&bytes, addr).await;
+                }
+                Some((bytes, addr)) = data_rx.recv() => {
+                    let _ = send_socket.send_to(&bytes, addr).await;
+                }
+                else => break,
+            }
+        }
+    });
+
+    // ─────────────────────────────────────────────────────────────────
+    // 수신 및 처리 루프
+    // ─────────────────────────────────────────────────────────────────
     let mut buf = vec![0u8; 65535];
-    let mut _client_addr: Option<SocketAddr> = None;
+    let data = Arc::new(data);
 
-    info!("Waiting for client connection...");
+    info!("Waiting for client connection (Init)...");
 
     loop {
         let (len, addr) = socket.recv_from(&mut buf).await?;
@@ -191,106 +232,136 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Ok(header) = bincode::deserialize::<MessageHeader>(&buf[..len.min(32)]) {
             match header.msg_type {
                 MessageType::Init => {
-                    _client_addr = Some(addr);
-                    info!("Client connected: {}", addr);
+                    // 초기화 요청 처리
+                    if let Some(init_req) = InitMessage::from_bytes(&buf[..len]) {
+                        info!("Init received from: {}", addr);
+                        info!("  Client encryption: {}", init_req.encryption_enabled);
+                        info!("  Protocol version: {}", init_req.protocol_version);
 
-                    // InitAck 전송
-                    let ack = InitAckMessage {
-                        nic_count: 1,
-                        chunk_size: config.chunk_size as u16,
-                        segment_size: config.segment_size as u32,
-                        redundancy_ratio: config.base_redundancy_ratio as f32,
-                    };
-                    socket.send_to(&ack.to_bytes(), addr).await?;
-
-                    // 데이터 전송 시작
-                    info!("Starting data transfer...");
-                    let start = std::time::Instant::now();
-
-                    let mut segment_id = 1u64;
-                    let mut offset = 0;
-                    let mut total_chunks = 0u64;
-                    let mut total_redundant = 0u64;
-
-                    while offset < data.len() {
-                        let end = (offset + config.segment_size).min(data.len());
-                        let segment_data = &data[offset..end];
-
-                        // 청크 분할
-                        let chunks = segment_builder.split_into_chunks(segment_id, segment_data, 0);
-                        let redundant_chunks = segment_builder
-                            .create_redundant_chunks(&chunks, config.base_redundancy_ratio);
-
-                        // 원본 청크 전송
-                        for chunk in &chunks {
-                            let bytes = chunk.to_bytes();
-                            socket.send_to(&bytes, addr).await?;
-                            total_chunks += 1;
-
-                            if config.chunk_interval_us > 0 {
-                                tokio::time::sleep(Duration::from_micros(config.chunk_interval_us))
-                                    .await;
-                            }
-                        }
-
-                        // 중복 청크 전송
-                        for chunk in &redundant_chunks {
-                            let bytes = chunk.to_bytes();
-                            socket.send_to(&bytes, addr).await?;
-                            total_redundant += 1;
-
-                            if config.chunk_interval_us > 0 {
-                                tokio::time::sleep(Duration::from_micros(config.chunk_interval_us))
-                                    .await;
-                            }
-                        }
-
-                        info!(
-                            "Segment {} sent: {} chunks + {} redundant",
-                            segment_id,
-                            chunks.len(),
-                            redundant_chunks.len()
+                        // InitAck 응답 생성
+                        let mut init_ack = InitAckMessage::new(
+                            data.len() as u64,
+                            config.chunk_size as u16,
+                            config.segment_size as u32,
+                            config.base_redundancy_ratio as f32,
                         );
+                        init_ack.encryption_enabled = init_req.encryption_enabled;
 
-                        segment_id += 1;
-                        offset = end;
+                        // InitAck을 우선순위 큐로 전송
+                        let _ = priority_tx.send((init_ack.to_bytes(), addr)).await;
+                        
+                        info!("InitAck queued (priority):");
+                        info!("  Total file size: {} bytes", init_ack.total_file_size);
+                        info!("  Total segments: {}", init_ack.total_segments);
+
+                        // 데이터 전송 시작 (별도 태스크로)
+                        let data_clone = data.clone();
+                        let config_clone = config.clone();
+                        let segment_builder_clone = segment_builder.clone();
+                        let segment_cache_clone = segment_cache.clone();
+                        let data_tx_clone = data_tx.clone();
+                        
+                        tokio::spawn(async move {
+                            info!("Starting data transfer...");
+                            let start = std::time::Instant::now();
+
+                            let mut segment_id = 1u64;
+                            let mut offset = 0;
+                            let mut total_chunks = 0u64;
+                            let total_segments = init_ack.total_segments;
+
+                            while offset < data_clone.len() {
+                                let end = (offset + config_clone.segment_size).min(data_clone.len());
+                                let segment_data = &data_clone[offset..end];
+
+                                // 세그먼트 캐시 저장
+                                {
+                                    let mut cache = segment_cache_clone.write().await;
+                                    cache.insert(segment_id, segment_data.to_vec());
+                                }
+
+                                // 청크 분할 및 전송
+                                let chunks = segment_builder_clone.split_into_chunks(segment_id, segment_data, 0);
+                                let redundant_chunks = segment_builder_clone
+                                    .create_redundant_chunks(&chunks, config_clone.base_redundancy_ratio);
+
+                                for chunk in chunks.iter().chain(redundant_chunks.iter()) {
+                                    let bytes = chunk.to_bytes();
+                                    // 일반 데이터 큐로 전송
+                                    if data_tx_clone.send((bytes, addr)).await.is_err() {
+                                        return;
+                                    }
+                                    total_chunks += 1;
+                                }
+
+                                if segment_id % 10 == 0 || offset + config_clone.segment_size >= data_clone.len() {
+                                    info!(
+                                        "Progress: segment {}/{} ({:.1}%)",
+                                        segment_id, total_segments,
+                                        (offset as f64 / data_clone.len() as f64) * 100.0
+                                    );
+                                }
+
+                                segment_id += 1;
+                                offset = end;
+                            }
+
+                            let elapsed = start.elapsed();
+                            let throughput = data_clone.len() as f64 / elapsed.as_secs_f64() / 1_000_000.0;
+
+                            info!("Initial transfer complete!");
+                            info!("  Time: {:.2}s", elapsed.as_secs_f64());
+                            info!("  Total chunks: {}", total_chunks);
+                            info!("  Throughput: {:.2} MB/s", throughput);
+                            info!("Waiting for NACK retransmission requests...");
+                        });
                     }
-
-                    let elapsed = start.elapsed();
-                    let throughput = data.len() as f64 / elapsed.as_secs_f64() / 1_000_000.0;
-
-                    info!("Transfer complete!");
-                    info!("  Time: {:.2}s", elapsed.as_secs_f64());
-                    info!("  Total chunks: {}", total_chunks);
-                    info!("  Redundant chunks: {}", total_redundant);
-                    info!("  Throughput: {:.2} MB/s", throughput);
                 }
 
                 MessageType::Nack => {
-                    // NACK 처리
+                    // NACK 처리 - 재전송
                     if let Some(nack) = NackMessage::from_bytes(&buf[..len]) {
-                        info!(
-                            "NACK received: segment={}, missing={} chunks",
-                            nack.segment_id,
-                            nack.missing_chunk_ids.len()
-                        );
+                        let segment_builder_clone = segment_builder.clone();
+                        let segment_cache_clone = segment_cache.clone();
+                        let data_tx_clone = data_tx.clone();
+                        
+                        // 재전송도 별도 태스크로 처리
+                        tokio::spawn(async move {
+                            let cache = segment_cache_clone.read().await;
+                            if let Some(segment_data) = cache.get(&nack.segment_id) {
+                                let chunks = segment_builder_clone.split_into_chunks(
+                                    nack.segment_id,
+                                    segment_data,
+                                    0,
+                                );
 
-                        // 재전송 (간단 구현 - 세그먼트 재구성 필요)
-                        // 실제로는 세그먼트 상태를 저장해야 함
+                                for &chunk_id in &nack.missing_chunk_ids {
+                                    if let Some(chunk) = chunks.iter().find(|c| c.header.chunk_id == chunk_id) {
+                                        let bytes = chunk.to_bytes();
+                                        let _ = data_tx_clone.send((bytes, addr)).await;
+                                    }
+                                }
+                            }
+                        });
                     }
                 }
 
                 MessageType::SegmentComplete => {
-                    info!("Segment complete confirmation received");
+                    // 세그먼트 완료 - 캐시에서 제거 가능
                 }
 
                 MessageType::Close => {
                     info!("Client disconnected: {}", addr);
-                    _client_addr = None;
                 }
 
                 _ => {}
             }
         }
+    }
+
+    #[allow(unreachable_code)]
+    {
+        let _ = _send_task.await;
+        Ok(())
     }
 }

@@ -273,12 +273,12 @@ impl Sender {
                 // 연결 초기화
                 *self.client_addr.write() = Some(addr);
 
-                let ack = InitAckMessage {
-                    nic_count: self.path_manager.nic_count() as u8,
-                    chunk_size: self.config.chunk_size as u16,
-                    segment_size: self.config.segment_size as u32,
-                    redundancy_ratio: *self.current_redundancy.read() as f32,
-                };
+                let ack = InitAckMessage::new(
+                    0, // total_file_size - will be set when data is known
+                    self.config.chunk_size as u16,
+                    self.config.segment_size as u32,
+                    *self.current_redundancy.read() as f32,
+                );
 
                 socket.send_to(&ack.to_bytes(), addr).await?;
                 info!("클라이언트 연결: {}", addr);

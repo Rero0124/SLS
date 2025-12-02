@@ -255,12 +255,7 @@ impl Receiver {
         let completed_count = Arc::new(AtomicU64::new(0));
 
         // 초기화 메시지 전송
-        let init = InitMessage {
-            nic_count: path_manager.nic_count() as u8,
-            chunk_size: config.chunk_size as u16,
-            segment_size: config.segment_size as u32,
-            buffer_size: config.recv_buffer_size as u32,
-        };
+        let init = InitMessage::new(false, [0u8; 32]);
         socket.send_to(&init.to_bytes(), server_addr).await?;
 
         info!("SLS Receiver started on {}, server: {}", bind_addr, server_addr);
