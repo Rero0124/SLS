@@ -313,8 +313,19 @@ async fn run_server(
             cache.insert(segment_id, chunks.clone());
         }
 
-        // 청크 전송 (채널에 적재)
+        // 청크 전송 (채널에 적재) - 백프레셔 적용
         let mut segment_bytes = 0usize;
+        const MIN_CAPACITY: usize = 70_000;  // 남은 공간이 이보다 적으면 대기
+        const RESUME_CAPACITY: usize = 190_000;  // 이만큼 회복되면 재개
+        
+        // 큐가 너무 차면 대기 (남은 용량이 적으면)
+        while tx.capacity() < MIN_CAPACITY {
+            tokio::time::sleep(Duration::from_micros(100)).await;
+            if tx.capacity() >= RESUME_CAPACITY {
+                break;
+            }
+        }
+        
         for chunk in &chunks {
             let bytes = chunk.to_bytes();
             segment_bytes += bytes.len();
@@ -330,23 +341,10 @@ async fn run_server(
         
         segments_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         
-        // BBR 세그먼트 기반 pacing
-        {
-            let mut b = bbr.lock().await;
-            b.on_packet_sent(segment_bytes);
-            
-            // pacing_rate 기반 대기 시간 계산
-            let target_us = (segment_bytes as f64 / b.pacing_rate * 1_000_000.0) as u64;
-            drop(b);
-            
-            if target_us > 10 {
-                tokio::time::sleep(Duration::from_micros(target_us)).await;
-            }
-        }
-        
-        // 100 세그먼트마다 BBR 업데이트
+        // BBR 통계 업데이트 (대기 없이)
         if segment_id % 100 == 0 {
             let mut b = bbr.lock().await;
+            b.on_packet_sent(segment_bytes * 100);
             b.update_rate();
         }
 
